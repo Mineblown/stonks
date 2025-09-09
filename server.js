@@ -1,5 +1,6 @@
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const { spawnSync } = require('child_process');
 
@@ -25,8 +26,30 @@ function getLatestDate() {
 }
 
 /**
+ * Load weights from config/weights.json; fall back to config/defaultWeights.json.
+ */
+function loadWeights() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'config', 'weights.json'), 'utf8'));
+  } catch {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(__dirname, 'config', 'defaultWeights.json'), 'utf8'));
+    } catch {
+      return {};
+    }
+  }
+}
+
+/**
+ * Persist weights to config/weights.json.
+ */
+function saveWeights(w) {
+  fs.writeFileSync(path.join(__dirname, 'config', 'weights.json'), JSON.stringify(w, null, 2));
+}
+
+/**
  * Endpoint: GET /api/latest-date
- * Returns {date:<latest_date>} or {date:null} if no scores.
+ * Returns {date: } or {date:null} if no scores.
  */
 app.get('/api/latest-date', (req, res) => {
   const d = getLatestDate();
@@ -45,7 +68,7 @@ app.get('/api/scores/:date', (req, res) => {
 
 /**
  * Endpoint: GET /api/scores_filtered/:date
- * Returns filtered, paginated scores for a given date with fundamentals and universe fields joined.
+ * Returns filtered, paginated scores for a given date with scores and universe fields joined.
  * Query params:
  *   q        – optional substring match for ticker (case‑insensitive)
  *   min_mcap – minimum market cap (USD)
@@ -65,20 +88,12 @@ app.get('/api/scores_filtered/:date', (req, res) => {
     SELECT
       s.ticker, s.date,
       s.momentum, s.volatility, s.volume, s.vwap_dev,
-      f.pe, f.pb, f.de, f.fcf_yield, f.peg, f.ps, f.roe, f.dividend_yield,
+      s.pe, s.pb, s.de, s.fcf_yield, s.peg, s.peg3, s.ps, s.roe, s.dividend_yield,
       s.composite,
       u.market_cap, u.avg_volume
     FROM scores AS s
     LEFT JOIN universe AS u
       ON u.date = s.date AND u.ticker = s.ticker
-    LEFT JOIN fundamentals AS f
-      ON f.ticker = s.ticker
-     AND f.updated_at = (
-        SELECT MAX(updated_at)
-        FROM fundamentals
-        WHERE ticker = s.ticker
-          AND DATE(updated_at) <= DATE(s.date)
-      )
     WHERE s.date = @date
       AND (@q = '' OR s.ticker LIKE '%' || @q || '%')
       AND (u.market_cap IS NULL OR u.market_cap >= @minCap)
@@ -104,7 +119,7 @@ app.get('/api/scores_filtered/:date', (req, res) => {
 
 /**
  * Endpoint: GET /api/top50
- * Returns the top 50 tickers (by composite) for the latest or specified date with fundamentals joined.
+ * Returns the top 50 tickers (by composite) for the latest or specified date.
  * Query params:
  *   date – optional date (YYYY-MM-DD). Defaults to latest date.
  */
@@ -114,24 +129,131 @@ app.get('/api/top50', (req, res) => {
   const rows = db.prepare(`
     SELECT
       s.ticker, s.composite,
-      f.pe, f.pb, f.de, f.fcf_yield, f.peg, f.ps, f.roe, f.dividend_yield,
+      s.pe, s.pb, s.de, s.fcf_yield, s.peg, s.peg3, s.ps, s.roe, s.dividend_yield,
       u.market_cap, u.avg_volume
     FROM scores AS s
     LEFT JOIN universe AS u
       ON u.date = s.date AND u.ticker = s.ticker
-    LEFT JOIN fundamentals AS f
-      ON f.ticker = s.ticker
-     AND f.updated_at = (
-        SELECT MAX(updated_at)
-        FROM fundamentals
-        WHERE ticker = s.ticker
-          AND DATE(updated_at) <= DATE(s.date)
-      )
     WHERE s.date = @date
     ORDER BY s.composite DESC
     LIMIT 50;
   `).all({ date });
   res.json(rows);
+});
+
+/**
+ * Endpoint: GET /api/top10
+ * Returns the top 10 tickers (by composite) for the latest or specified date.
+ * Query params:
+ *   date – optional date (YYYY-MM-DD). Defaults to latest date.
+ */
+app.get('/api/top10', (req, res) => {
+  const date = req.query.date || getLatestDate();
+  if (!date) return res.json([]);
+  const rows = db.prepare(`
+    SELECT
+      s.ticker, s.composite,
+      s.pe, s.pb, s.de, s.fcf_yield, s.peg, s.peg3, s.ps, s.roe, s.dividend_yield,
+      u.market_cap, u.avg_volume
+    FROM scores AS s
+    LEFT JOIN universe AS u
+      ON u.date = s.date AND u.ticker = s.ticker
+    WHERE s.date = @date
+    ORDER BY s.composite DESC
+    LIMIT 10;
+  `).all({ date });
+  res.json(rows);
+});
+
+/**
+ * Endpoint: GET /api/top10_track
+ * Tracks the performance of the top 10 tickers chosen on the start date through the end date.
+ * Query params:
+ *   start – required start date (YYYY-MM-DD)
+ *   end   – required end date (YYYY-MM-DD)
+ */
+app.get('/api/top10_track', (req, res) => {
+  const start = req.query.start;
+  const end = req.query.end;
+  if (!start || !end) return res.status(400).json({ error: 'start and end are required (YYYY-MM-DD)' });
+
+  // Pick top 10 tickers on the start date
+  const picks = db.prepare(`
+    SELECT ticker
+    FROM scores
+    WHERE date = @start
+    ORDER BY composite DESC
+    LIMIT 10
+  `).all({ start }).map(r => r.ticker);
+
+  if (!picks.length) return res.json({ series: [], summary: { start, end, picks, totalRet: 0 } });
+
+  // Build list of dates within the range
+  const dates = db.prepare(`SELECT DISTINCT date FROM daily_bars WHERE date BETWEEN @start AND @end ORDER BY date`)
+                  .all({ start, end }).map(r => r.date);
+  if (!dates.length) return res.json({ series: [], summary: { start, end, picks, totalRet: 0 } });
+
+  let index = 1.0;
+  const series = [];
+  let prevPrices = new Map();
+
+  // Seed previous prices with start date closes
+  const seedRows = db.prepare(
+    `SELECT ticker, close FROM daily_bars WHERE date = @d AND ticker IN (${picks.map(() => '?').join(',')})`
+  ).all(...[{ d: start }].flatMap(o => [o.d, ...picks]));
+  for (const r of seedRows) prevPrices.set(r.ticker, r.close);
+
+  for (const d of dates) {
+    const rows = db.prepare(
+      `SELECT ticker, close FROM daily_bars WHERE date = @d AND ticker IN (${picks.map(() => '?').join(',')})`
+    ).all(...[{ d }].flatMap(o => [o.d, ...picks]));
+
+    let sumRet = 0;
+    let count = 0;
+    for (const { ticker, close } of rows) {
+      const prev = prevPrices.get(ticker);
+      if (prev != null && prev > 0 && close != null) {
+        sumRet += (close - prev) / prev;
+        count++;
+      }
+    }
+    const dailyRet = count > 0 ? sumRet / count : 0;
+    index *= (1 + dailyRet);
+    series.push({ date: d, value: index, dailyRet });
+    prevPrices = new Map();
+    for (const { ticker, close } of rows) {
+      prevPrices.set(ticker, close);
+    }
+  }
+
+  const totalRet = series.length ? (series[series.length - 1].value - 1) : 0;
+  res.json({ series, summary: { start, end, picks, totalRet } });
+});
+
+/**
+ * Weight endpoints:
+ *   GET /api/weights        – read current weights or defaults
+ *   POST /api/weights       – set new weights (JSON body)
+ *   POST /api/weights/reset – reset to default weights
+ */
+app.get('/api/weights', (_req, res) => {
+  res.json(loadWeights());
+});
+
+app.post('/api/weights', express.json(), (req, res) => {
+  const w = req.body || {};
+  saveWeights(w);
+  res.json({ ok: true, weights: w });
+});
+
+app.post('/api/weights/reset', (_req, res) => {
+  try {
+    const def = JSON.parse(fs.readFileSync(path.join(__dirname, 'config', 'defaultWeights.json'), 'utf8'));
+    saveWeights(def);
+    res.json({ ok: true, weights: def });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 /**
@@ -218,7 +340,7 @@ app.get('/api/backtest', (req, res) => {
 app.get('/api/status', (req, res) => {
   const statusFile = path.join(__dirname, 'data', 'status.json');
   try {
-    const status = require('fs').readFileSync(statusFile, 'utf8');
+    const status = fs.readFileSync(statusFile, 'utf8');
     res.json(JSON.parse(status));
   } catch {
     res.json({ running: false });
