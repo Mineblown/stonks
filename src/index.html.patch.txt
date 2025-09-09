@@ -1,0 +1,2 @@
+<!-- PATCH: rename app -->
+<!-- In <head><title> and header text, change to StonksFYI -->

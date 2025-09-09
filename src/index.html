@@ -1,0 +1,132 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StonksFYI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: { bg:'#0b1020', panel:'#121936', accent:'#35d39e' }}}}
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+</head>
+<body class="bg-bg text-slate-100 min-h-screen">
+  <header class="border-b border-slate-700/50 bg-[#0d1430]">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+      <div>
+        <h1 class="text-2xl font-semibold">StonksFYI</h1>
+        <p class="text-slate-400">Automatic EOD data + composite scoring</p>
+      </div>
+      <a href="#" id="refreshBtn" class="px-3 py-2 rounded-lg bg-accent text-black font-semibold">Refresh</a>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+    <!-- Top 50 Picks -->
+    <section class="bg-panel/70 border border-slate-700/50 rounded-2xl p-4 shadow-lg">
+      <div class="flex items-center justify-between">
+        <h2 class="text-xl font-semibold">Top 50 Picks (by Composite)</h2>
+        <div class="text-slate-400 text-sm" id="top50-date"></div>
+      </div>
+      <div id="top50-grid" class="grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3 mt-3"></div>
+    </section>
+
+    <!-- Existing filters + table -->
+    <section class="bg-panel/70 border border-slate-700/50 rounded-2xl p-4 shadow-lg">
+      <div class="grid md:grid-cols-2 gap-4 items-end">
+        <div class="space-y-2">
+          <label class="text-sm text-slate-300">Search</label>
+          <input id="search" placeholder="Filter by ticker (e.g., AAPL)" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none w-full" />
+        </div>
+        <div class="flex gap-3 items-end">
+          <div>
+            <label class="text-sm text-slate-300">Date</label>
+            <input type="date" id="score-date" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none" />
+          </div>
+          <button id="latest-btn" class="px-3 py-2 rounded-lg bg-slate-300 text-black font-semibold">Latest</button>
+          <button id="load-scores-btn" class="px-3 py-2 rounded-lg bg-accent text-black font-semibold">Load Scores</button>
+        </div>
+      </div>
+
+      <div class="grid md:grid-cols-4 gap-4 mt-4">
+        <div>
+          <label class="text-sm text-slate-300">Min Market Cap (USD)</label>
+          <input id="min-mcap" type="number" placeholder="500000000" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none w-full" />
+        </div>
+        <div>
+          <label class="text-sm text-slate-300">Min Avg Volume</label>
+          <input id="min-vol" type="number" placeholder="300000" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none w-full" />
+        </div>
+        <div>
+          <label class="text-sm text-slate-300">Rows / page</label>
+          <select id="rows-per-page" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none w-full">
+            <option>25</option>
+            <option selected>50</option>
+            <option>100</option>
+          </select>
+        </div>
+        <div class="flex items-end gap-2">
+          <button id="apply-filters" class="px-3 py-2 rounded-lg bg-indigo-400 text-black font-semibold w-full">Apply Filters</button>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto mt-4">
+        <table class="min-w-full text-sm">
+          <thead class="text-slate-300 bg-[#0d1430]">
+            <tr>
+              <th class="text-left py-2 px-2">Ticker</th>
+              <th class="py-2 px-2">Momentum</th>
+              <th class="py-2 px-2">Volatility</th>
+              <th class="py-2 px-2">Volume</th>
+              <th class="py-2 px-2">VWAP Dev</th>
+              <th class="py-2 px-2">P/E</th>
+              <th class="py-2 px-2">P/B</th>
+              <th class="py-2 px-2">D/E</th>
+              <th class="py-2 px-2">FCF Yield</th>
+              <th class="py-2 px-2">PEG</th>
+              <th class="py-2 px-2">P/S</th>
+              <th class="py-2 px-2">ROE</th>
+              <th class="py-2 px-2">Div Yield</th>
+              <th class="py-2 px-2 text-emerald-300">Composite ★</th>
+            </tr>
+          </thead>
+          <tbody id="scores-tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="flex items-center justify-between mt-3">
+        <div class="text-slate-400"><span id="total-span">0</span> results</div>
+        <div class="flex gap-2">
+          <button id="prev-btn" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 disabled:opacity-50">Prev</button>
+          <button id="next-btn" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 disabled:opacity-50">Next</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Backtest panel kept as-is in your project -->
+    <section class="bg-panel/70 border border-slate-700/50 rounded-2xl p-4 shadow-lg">
+      <div class="flex flex-wrap items-center gap-3 mb-3">
+        <div class="text-slate-300">
+          <strong>Backtest</strong>
+          <span class="ml-2 text-slate-400">(Top % = share of highest composite scores we “buy” each monthly rebalance)</span>
+        </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-3">
+        <input type="date" id="backtest-start" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none" />
+        <input type="date" id="backtest-end" class="px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none" />
+        <div class="flex items-center gap-2">
+          <span class="text-sm text-slate-300">Top %</span>
+          <input type="number" id="backtest-top" value="20" min="1" max="50" class="w-20 px-3 py-2 rounded-lg bg-[#0b1026] border border-slate-700/60 outline-none" />
+        </div>
+        <button id="run-backtest-btn" class="px-3 py-2 rounded-lg bg-indigo-400 text-black font-semibold">Run Backtest</button>
+      </div>
+      <canvas id="btChart" height="120" class="mt-4"></canvas>
+    </section>
+  </main>
+
+  <footer class="text-center text-slate-500 py-6">© StonksFYI</footer>
+  <script src="script.js"></script>
+</body>
+</html>

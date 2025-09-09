@@ -1,0 +1,34 @@
+{
+  "name": "stock-quant-app",
+  "version": "1.0.0",
+  "description": "A simple Node.js application for computing custom quant scores using Polygon.io daily aggregates and comparing the resulting portfolio to the S&P 500.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "fetch-daily": "node scripts/fetchDailyData.js",
+    "fetch-sp500": "node scripts/fetchSp500.js",
+    "compute-scores": "node scripts/computeScores.js",
+    "compute-backtest": "node scripts/computeBacktest.js",
+    "init:db": "node scripts/initDb.js",
+    "schedule": "node scripts/schedule.js",
+    "backfill": "node scripts/backfillRange.js"
+  },
+  "keywords": [
+    "quantitative",
+    "finance",
+    "polygon.io",
+    "node",
+    "express"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "date-fns": "^2.31.1",
+    "chart.js": "^4.4.0",
+    "better-sqlite3": "^9.4.2",
+    "node-cron": "^3.0.2"
+  }
+}

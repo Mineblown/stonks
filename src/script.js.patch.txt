@@ -1,0 +1,2 @@
+// PATCH: in src/script.js ensure rowsPerPage default = 50 and initial load calls loadFiltered()
+// Already implemented in previous UX patch; this note clarifies defaults.
