@@ -1,21 +1,25 @@
-
+#!/usr/bin/env node
 /**
  * scripts/fetchFundamentalsFromPolygon.js
- * Populates fundamentals_latest and fundamentals_history using Polygon.io.
- * Requires env: POLYGON_API_KEY
- * Usage:
+ *
+ * Fetch fundamentals from Polygon for a set of tickers and upsert into SQLite.
+ * Uses Polygon v3 reference financials endpoint and extracts numeric values via `.value`.
+ * Writes both fundamentals_latest and fundamentals_history and logs progress per ticker.
+ *
+ * Usage examples:
+ *   export POLYGON_API_KEY=YOUR_KEY
  *   node scripts/fetchFundamentalsFromPolygon.js --tickers NVDA,AAPL,MSFT
- *   node scripts/fetchFundamentalsFromPolygon.js --universe 2025-09-09
+ *   node scripts/fetchFundamentalsFromPolygon.js --universe 2025-09-09 --max 500
  */
 const Database = require('better-sqlite3');
 const path = require('path');
 const axios = require('axios');
-const fs = require('fs');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'quant.db');
 const API_KEY = process.env.POLYGON_API_KEY;
 if (!API_KEY) {
-  console.error('Set POLYGON_API_KEY in your environment'); process.exit(1);
+  console.error('Set POLYGON_API_KEY in your environment before running.');
+  process.exit(1);
 }
 
 const db = new Database(DB_PATH);
@@ -52,114 +56,217 @@ CREATE TABLE IF NOT EXISTS fundamentals_history (
 );
 `);
 
-function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-
-async function getPolygonFinancials(ticker, limit=20) {
-  // Annual & quarterly mixed; you can filter via type param if desired.
-  const url = `https://api.polygon.io/vX/reference/financials?ticker=${encodeURIComponent(ticker)}&limit=${limit}&apiKey=${API_KEY}`;
-  const { data } = await axios.get(url, { timeout: 30000 });
-  return data;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function mapToLatestRow(ticker, fin) {
-  // Try to map Polygon fields defensively
-  const i = fin;
-  const NI = i?.income_statement?.net_income_loss || i?.income_statement?.net_income || null;
-  const SH_EQ = i?.balance_sheet?.stockholders_equity || i?.balance_sheet?.shareholders_equity || null;
-  const TOT_LIAB = i?.balance_sheet?.liabilities || i?.balance_sheet?.total_liabilities || null;
-  const REV = i?.income_statement?.revenues || i?.income_statement?.revenue || null;
-  const OCF = i?.cash_flow_statement?.net_cash_provided_by_used_in_operating_activities || i?.cash_flow_statement?.net_cash_flow_from_operating_activities || null;
-  const CAPEX = i?.cash_flow_statement?.payments_for_property_plant_and_equipment || i?.cash_flow_statement?.capital_expenditure || null;
-  const DIV = i?.cash_flow_statement?.payments_of_dividends || i?.cash_flow_statement?.dividends_paid || null;
-  const SO = i?.income_statement?.weighted_average_shares_outstanding_basic || i?.income_statement?.weighted_average_shares_outstanding || null;
+async function polygonFinancials(ticker, limit = 16) {
+  const url = `https://api.polygon.io/v3/reference/financials?ticker=${encodeURIComponent(ticker)}&limit=${limit}&apiKey=${API_KEY}`;
+  const { data } = await axios.get(url, { timeout: 30000 });
+  return data?.results || [];
+}
 
-  return {
-    ticker,
-    filing_date: i?.fiscal_period || i?.end_date || i?.filing_date || null,
-    net_income: NI,
-    shareholders_equity: SH_EQ,
-    total_liabilities: TOT_LIAB,
-    revenue: REV,
-    op_cash: OCF,
-    capex: CAPEX,
-    dividends: DIV,
-    shares_outstanding: SO,
-    updated_at: new Date().toISOString()
-  };
+function val(x) {
+  if (x == null) return null;
+  if (typeof x === 'number') return x;
+  if (typeof x === 'object' && 'value' in x) return x.value;
+  return null;
+}
+
+function firstNonNull(...xs) {
+  for (const x of xs) {
+    if (x != null) return x;
+  }
+  return null;
 }
 
 function upsertLatest(row) {
   const cols = Object.keys(row);
-  const placeholders = cols.map(c => '@'+c).join(', ');
-  const assigns = cols.map(c => `${c}=excluded.${c}`).join(', ');
+  const placeholders = cols.map(c => '@' + c).join(', ');
+  const assigns = cols.map(c => `${c} = excluded.${c}`).join(', ');
   const sql = `INSERT INTO fundamentals_latest (${cols.join(',')}) VALUES (${placeholders})
                ON CONFLICT(ticker) DO UPDATE SET ${assigns}`;
   db.prepare(sql).run(row);
 }
 
-function upsertHistory(ticker, i) {
-  const eps_basic = i?.income_statement?.basic_earnings_per_share || i?.income_statement?.earnings_per_share_basic || null;
-  const so = i?.income_statement?.weighted_average_shares_outstanding_basic || i?.income_statement?.weighted_average_shares_outstanding || null;
+function upsertHistory(ticker, fin) {
+  const inc = fin?.financials?.income_statement || {};
+
+  const eps_basic = firstNonNull(
+    val(inc.basic_earnings_per_share),
+    val(inc.earnings_per_share_basic),
+    val(inc.eps_basic)
+  );
+  const so = firstNonNull(
+    val(inc.weighted_average_shares_outstanding_basic),
+    val(inc.weighted_average_shares_outstanding)
+  );
+  const net_income = firstNonNull(
+    val(inc.net_income_loss),
+    val(inc.net_income)
+  );
+  const revenue = firstNonNull(
+    val(inc.revenues),
+    val(inc.revenue)
+  );
+
+  const period_end = firstNonNull(
+    fin?.period_of_report_date,
+    fin?.end_date,
+    fin?.filing_date
+  ) || new Date().toISOString().slice(0, 10);
+
   const row = {
     ticker,
-    period_end: i?.end_date || i?.calendar_date || i?.fiscal_period || new Date().toISOString().slice(0,10),
+    period_end,
     eps_basic,
-    net_income: i?.income_statement?.net_income_loss || i?.income_statement?.net_income || null,
+    net_income,
     shares_outstanding: so,
-    revenue: i?.income_statement?.revenues || i?.income_statement?.revenue || null
+    revenue
   };
-  const sql = `INSERT INTO fundamentals_history (ticker, period_end, eps_basic, net_income, shares_outstanding, revenue)
-               VALUES (@ticker, @period_end, @eps_basic, @net_income, @shares_outstanding, @revenue)
-               ON CONFLICT(ticker, period_end) DO UPDATE SET
-                 eps_basic=excluded.eps_basic,
-                 net_income=excluded.net_income,
-                 shares_outstanding=excluded.shares_outstanding,
-                 revenue=excluded.revenue`;
+
+  const sql = `INSERT INTO fundamentals_history
+    (ticker, period_end, eps_basic, net_income, shares_outstanding, revenue)
+    VALUES (@ticker, @period_end, @eps_basic, @net_income, @shares_outstanding, @revenue)
+    ON CONFLICT(ticker, period_end) DO UPDATE SET
+      eps_basic = excluded.eps_basic,
+      net_income = excluded.net_income,
+      shares_outstanding = excluded.shares_outstanding,
+      revenue = excluded.revenue`;
   db.prepare(sql).run(row);
 }
 
-async function fetchForTicker(t) {
-  try {
-    const data = await getPolygonFinancials(t, 32);
-    const results = data?.results || [];
-    if (!results.length) return;
-    // Latest first
-    const latest = mapToLatestRow(t, results[0]);
-    upsertLatest(latest);
-    results.forEach(r => upsertHistory(t, r));
-  } catch (e) {
-    console.error('fetch error for', t, e?.response?.status, e?.message);
-  }
+function mapToLatestRow(ticker, fin) {
+  const inc = fin?.financials?.income_statement || {};
+  const bal = fin?.financials?.balance_sheet || {};
+  const cfs = fin?.financials?.cash_flow_statement || {};
+
+  const netIncome = firstNonNull(
+    val(inc.net_income_loss),
+    val(inc.net_income)
+  );
+  const equity = firstNonNull(
+    val(bal.stockholders_equity),
+    val(bal.shareholders_equity),
+    val(bal.total_shareholders_equity),
+    val(bal.total_equity)
+  );
+  const liabilities = firstNonNull(
+    val(bal.liabilities),
+    val(bal.total_liabilities)
+  );
+  const revenue = firstNonNull(
+    val(inc.revenues),
+    val(inc.revenue),
+    val(inc.sales)
+  );
+  const operatingCashFlow = firstNonNull(
+    val(cfs.net_cash_provided_by_used_in_operating_activities),
+    val(cfs.net_cash_flow_from_operating_activities),
+    val(cfs.net_cash_from_operating_activities)
+  );
+  const capex = firstNonNull(
+    val(cfs.payments_for_property_plant_and_equipment),
+    val(cfs.capital_expenditure),
+    val(cfs.capital_expenditures)
+  );
+  const dividends = firstNonNull(
+    val(cfs.payments_of_dividends),
+    val(cfs.dividends_paid)
+  );
+  const sharesOutstanding = firstNonNull(
+    val(inc.weighted_average_shares_outstanding_basic),
+    val(inc.weighted_average_shares_outstanding)
+  );
+  const filing_date = firstNonNull(
+    fin?.period_of_report_date,
+    fin?.end_date,
+    fin?.start_date,
+    fin?.filing_date
+  );
+
+  return {
+    ticker,
+    filing_date: filing_date || null,
+    net_income: netIncome,
+    shareholders_equity: equity,
+    total_liabilities: liabilities,
+    revenue: revenue,
+    op_cash: operatingCashFlow,
+    capex: capex,
+    dividends: dividends,
+    shares_outstanding: sharesOutstanding,
+    updated_at: new Date().toISOString()
+  };
 }
 
-function getUniverseTickersForDate(date) {
-  const rows = db.prepare(`SELECT ticker FROM universe WHERE date=@date`).all({ date });
-  if (rows.length) return rows.map(r=>r.ticker);
-  // fallback: distinct tickers from daily_bars
-  return db.prepare(`SELECT DISTINCT ticker FROM daily_bars WHERE date=@date`).all({ date }).map(r=>r.ticker);
+function universeTickers(date) {
+  const u = db.prepare(`SELECT ticker FROM universe WHERE date = ?`).all(date);
+  if (u.length) return u.map(r => r.ticker);
+  // fallback: all tickers seen in daily_bars on that date
+  return db.prepare(`SELECT DISTINCT ticker FROM daily_bars WHERE date=?`).all(date).map(r => r.ticker);
 }
 
 async function main() {
   const args = process.argv.slice(2);
   let tickers = [];
+  let max = Infinity;
+  let date = null;
+
+  if (args.includes('--max')) {
+    const maxIndex = args.indexOf('--max') + 1;
+    max = parseInt(args[maxIndex] || '0', 10) || Infinity;
+  }
+
   if (args.includes('--tickers')) {
-    const idx = args.indexOf('--tickers');
-    tickers = (args[idx+1] || '').split(',').map(s=>s.trim()).filter(Boolean);
+    const list = args[args.indexOf('--tickers') + 1] || '';
+    tickers = list.split(',').map(s => s.trim()).filter(Boolean);
   } else if (args.includes('--universe')) {
-    const idx = args.indexOf('--universe');
-    const date = args[idx+1];
-    if (!date) { console.error('--universe requires a date'); process.exit(1); }
-    tickers = getUniverseTickersForDate(date);
+    date = args[args.indexOf('--universe') + 1];
+    if (!date) {
+      console.error('--universe requires a date, e.g. 2025-09-09');
+      process.exit(1);
+    }
+    tickers = universeTickers(date);
   } else {
-    console.error('Usage: node scripts/fetchFundamentalsFromPolygon.js --tickers AAPL,MSFT or --universe 2025-09-09');
+    console.error('Usage: --tickers T1,T2 or --universe YYYY-MM-DD [--max N]');
     process.exit(1);
   }
 
+  if (!tickers.length) {
+    console.log('No tickers to process.');
+    return;
+  }
+  if (max !== Infinity) {
+    tickers = tickers.slice(0, max);
+  }
+
+  console.log(`Fetching fundamentals for ${tickers.length} tickers${date ? ' (universe ' + date + ')' : ''}`);
+  let done = 0;
   for (const t of tickers) {
-    await fetchForTicker(t);
-    await sleep(120); // be gentle with API rate limits
+    try {
+      const results = await polygonFinancials(t, 16);
+      if (results.length) {
+        const latest = mapToLatestRow(t, results[0]);
+        upsertLatest(latest);
+        for (const r of results) {
+          upsertHistory(t, r);
+        }
+        console.log(`[${++done}/${tickers.length}] ${t} — updated (${results.length} reports)`);
+      } else {
+        console.log(`[${++done}/${tickers.length}] ${t} — no results`);
+      }
+    } catch (e) {
+      done++;
+      console.log(`[${done}/${tickers.length}] ${t} — ERROR ${e?.response?.status || ''} ${e?.message}`);
+    }
+    await sleep(120); // Throttle to respect API limits
   }
   console.log('Done.');
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  main().catch(err => {
+    console.error(err);
+  });
+}
