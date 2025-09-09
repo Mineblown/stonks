@@ -348,10 +348,11 @@ app.get('/api/status', (req, res) => {
 });
 
 // Start scheduler if RUN_SCHEDULER is set to 1
+// Start scheduler if RUN_SCHEDULER is set to 1.  The schedule script
+// executes immediately upon require, so we don't call a start() function.
 if (process.env.RUN_SCHEDULER === '1') {
   try {
-    const sched = require('./scripts/schedule');
-    sched.start();
+    require('./scripts/schedule');
     console.log('Scheduler enabled.');
   } catch (e) {
     console.warn('Failed to start scheduler:', e.message);
